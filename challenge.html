@@ -43,14 +43,20 @@
       <div class="stat"><span>Total path length</span><strong id="statKm">–</strong></div>
       <div class="stat"><span>Median ground speed</span><strong id="statSpeed">–</strong></div>
       <div class="stat"><span>Wind alignment &lt; 45°</span><strong id="statAlign">–</strong></div>
+      <div class="stat"><span>Active severe alerts</span><strong id="statAlerts">–</strong></div>
+      <div class="stat"><span>Balloons in alerts</span><strong id="statAlertBalloons">–</strong></div>
       <div class="row">
         <div class="small">Tracks are colored by per‑segment ground speed (green → fast, red → slow). Hover markers for details. Updates every 5 minutes.</div>
+      </div>
+      <div class="row"><strong>Coverage priorities</strong>
+        <div class="small" id="recoList">Computing…</div>
       </div>
 
       <div class="row"><strong>Data Sources</strong>
         <div class="small">
           • WindBorne live snapshots: <code>a.windbornesystems.com/treasure/00..23.json</code><br/>
-          • External: <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open‑Meteo</a> hourly wind at 10m (no key)
+          • External: <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open‑Meteo</a> hourly wind at 10m (no key)<br/>
+          • Extreme alerts: <a href="https://www.weather.gov/documentation/services-web-api" target="_blank" rel="noreferrer">NOAA Weather API</a> (US + territories)
         </div>
         <div class="small" id="log" style="margin-top:6px; padding:6px; border:1px dashed #e5e7eb; border-radius:8px; background:#fafafa; max-height:120px; overflow:auto;">
           status: initializing…
@@ -89,10 +95,14 @@
     };
 
     const LOCAL_PROXY = 'http://127.0.0.1:8787';
+    const ALERTS_API = 'https://api.weather.gov/alerts/active?status=actual&message_type=alert&severity=Severe,Extreme&certainty=Observed,Likely&limit=200';
     const WIND_TILE_SIZE_DEG = 0.5; // quantize coordinates to reuse Open-Meteo responses
     const WIND_CACHE_TTL_MS = 30 * 60 * 1000;
     const WIND_MAX_PER_RENDER = 120;
     const meteoCache = new Map();
+    const COVERAGE_TILE_DEG = 10;
+    const COVERAGE_MAX_GAP_H = 6;
+    const COVERAGE_MIN_BALLOONS = 3;
 
     // Try to coerce a WindBorne record into {id, lat, lon, ts}
     function normalizeRecord(rec) {
@@ -327,6 +337,208 @@
       return tracks;
     }
 
+    async function fetchExtremeEvents() {
+      try {
+        const res = await fetch(ALERTS_API, {
+          headers: {
+            'Accept': 'application/geo+json',
+            'User-Agent': 'WindBorneChallengeMap/1.0 (demo@windborne.local)'
+          },
+          cache: 'no-store'
+        });
+        if (!res.ok) return [];
+        const data = await res.json();
+        return Array.isArray(data.features) ? data.features : [];
+      } catch (e) {
+        console.warn('alerts fetch failed', e);
+        return [];
+      }
+    }
+
+    function prepareAlertShapes(features, layer) {
+      layer.clearLayers();
+      const shapes = [];
+      let fallbackIdx = 0;
+      for (const feat of features) {
+        if (!feat || !feat.geometry) continue;
+        const props = feat.properties || {};
+        const severity = props.severity || 'unknown';
+        const title = props.event || props.headline || 'Alert';
+        const polygons = [];
+        if (feat.geometry.type === 'Polygon') polygons.push(feat.geometry.coordinates);
+        else if (feat.geometry.type === 'MultiPolygon') polygons.push(...feat.geometry.coordinates);
+        for (const rings of polygons) {
+          if (!rings || !rings.length) continue;
+          const outer = rings[0];
+          if (!outer || outer.length < 4) continue;
+          const latlngs = outer.map(([lon, lat]) => [lat, lon]);
+          const holeRings = rings.slice(1);
+          const color = severity === 'Extreme' ? '#b91c1c' : '#f97316';
+          L.polygon(latlngs, {
+            color,
+            weight: 2,
+            fillOpacity: 0.15,
+            opacity: 0.8
+          }).bindTooltip(
+            `<strong>${title}</strong><br/>Severity: ${severity}<br/>Areas: ${props.areaDesc || 'n/a'}`,
+            { sticky: true }
+          ).addTo(layer);
+          shapes.push({
+            id: feat.id || props.id || `alert-${fallbackIdx++}`,
+            title,
+            severity,
+            outer,
+            holes: holeRings
+          });
+        }
+      }
+      return shapes;
+    }
+
+    function pointInPolygon(point, polygon) {
+      if (!polygon || polygon.length < 3) return false;
+      let inside = false;
+      for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+        const xi = polygon[i][0], yi = polygon[i][1];
+        const xj = polygon[j][0], yj = polygon[j][1];
+        const intersects = ((yi > point[1]) !== (yj > point[1])) &&
+          (point[0] < (xj - xi) * (point[1] - yi) / ((yj - yi) || 1e-9) + xi);
+        if (intersects) inside = !inside;
+      }
+      return inside;
+    }
+
+    function pointInAlert(point, alert) {
+      if (!pointInPolygon(point, alert.outer)) return false;
+      if (alert.holes && alert.holes.length) {
+        for (const hole of alert.holes) {
+          if (pointInPolygon(point, hole)) return false;
+        }
+      }
+      return true;
+    }
+
+    function findAlertHit(point, alerts) {
+      for (const alert of alerts) {
+        if (pointInAlert(point, alert)) return alert;
+      }
+      return null;
+    }
+
+    function coverageCellForPoint(lat, lon) {
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+      const latIdx = Math.floor((lat + 90) / COVERAGE_TILE_DEG);
+      const lonIdx = Math.floor((lon + 180) / COVERAGE_TILE_DEG);
+      return {
+        key: `${latIdx}:${lonIdx}`,
+        latIdx,
+        lonIdx
+      };
+    }
+
+    function centroidOfRing(ring) {
+      if (!ring || ring.length < 3) return null;
+      let area = 0, cx = 0, cy = 0;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const [x0, y0] = ring[j];
+        const [x1, y1] = ring[i];
+        const cross = x0 * y1 - x1 * y0;
+        area += cross;
+        cx += (x0 + x1) * cross;
+        cy += (y0 + y1) * cross;
+      }
+      area *= 0.5;
+      if (Math.abs(area) < 1e-6) {
+        const sum = ring.reduce((acc, [x, y]) => [acc[0] + x, acc[1] + y], [0,0]);
+        return { lon: sum[0]/ring.length, lat: sum[1]/ring.length };
+      }
+      cx /= (6 * area);
+      cy /= (6 * area);
+      return { lon: cx, lat: cy };
+    }
+
+    function updateRecommendations(coverageCells, alertShapes, alertCoverage, coverageLayer) {
+      const suggestions = [];
+      const now = Date.now();
+      const tileSize = COVERAGE_TILE_DEG;
+      for (const cell of coverageCells.values()) {
+        const latMin = -90 + cell.latIdx * tileSize;
+        const lonMin = -180 + cell.lonIdx * tileSize;
+        const centerLat = latMin + tileSize / 2;
+        const centerLon = lonMin + tileSize / 2;
+        const gapH = cell.latest ? (now - cell.latest) / 3600000 : Infinity;
+        if (gapH > COVERAGE_MAX_GAP_H || cell.count < COVERAGE_MIN_BALLOONS) {
+          suggestions.push({
+            type: 'coverage',
+            priority: gapH + (COVERAGE_MIN_BALLOONS - Math.min(cell.count, COVERAGE_MIN_BALLOONS)),
+            lat: centerLat,
+            lon: centerLon,
+            latMin,
+            lonMin,
+            gapH,
+            count: cell.count
+          });
+        }
+      }
+
+      for (const alert of alertShapes) {
+        if (alertCoverage.covered.has(alert.id)) continue;
+        const centroid = centroidOfRing(alert.outer);
+        if (!centroid) continue;
+        suggestions.push({
+          type: 'alert',
+          priority: 100,
+          lat: centroid.lat,
+          lon: centroid.lon,
+          title: alert.title,
+          severity: alert.severity
+        });
+      }
+
+      suggestions.sort((a, b) => b.priority - a.priority);
+      const top = suggestions.slice(0, 5);
+
+      const list = document.getElementById('recoList');
+      if (!top.length) {
+        list.textContent = 'Coverage looks good across the monitored regions.';
+      } else {
+        list.innerHTML = top.map(s => {
+          if (s.type === 'alert') {
+            return `<div>🚨 ${s.title || 'Severe alert'}<br/><span class="small">No balloons sampling this area yet.</span></div>`;
+          }
+          return `<div>📡 ${s.lat.toFixed(1)}°, ${s.lon.toFixed(1)}°<br/><span class="small">${s.count} balloon(s), last sample ${s.gapH === Infinity ? 'never' : `${s.gapH.toFixed(1)}h`} ago.</span></div>`;
+        }).join('');
+      }
+
+      for (const s of top) {
+        if (s.type === 'coverage') {
+          const bounds = [
+            [s.latMin, s.lonMin],
+            [s.latMin + tileSize, s.lonMin + tileSize]
+          ];
+          L.rectangle(bounds, {
+            color: '#fbbf24',
+            weight: 1,
+            fillOpacity: 0.1,
+            dashArray: '4 4'
+          }).bindTooltip(
+            `Low coverage<br/>Last sample: ${s.gapH === Infinity ? 'none' : `${s.gapH.toFixed(1)}h ago`}<br/>Balloons: ${s.count}`,
+            { sticky: true }
+          ).addTo(coverageLayer);
+        } else if (s.type === 'alert') {
+          L.circleMarker([s.lat, s.lon], {
+            radius: 6,
+            color: '#f97316',
+            fillColor: '#f97316',
+            fillOpacity: 0.9
+          }).bindTooltip(
+            `Alert: ${s.title || 'Severe'}<br/>Need balloon coverage.`,
+            { sticky: true }
+          ).addTo(coverageLayer);
+        }
+      }
+    }
+
     async function fetchOpenMeteo(lat, lon, budget) {
       const quantizedLat = Math.round(lat / WIND_TILE_SIZE_DEG) * WIND_TILE_SIZE_DEG;
       const quantizedLon = Math.round(lon / WIND_TILE_SIZE_DEG) * WIND_TILE_SIZE_DEG;
@@ -375,6 +587,8 @@
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
     const layerGroup = L.layerGroup().addTo(map);
+    const alertsLayer = L.layerGroup().addTo(map);
+    const coverageLayer = L.layerGroup().addTo(map);
     const legend = L.control({ position: 'bottomright' });
     legend.onAdd = function() {
       const div = L.DomUtil.create('div', 'legend');
@@ -390,16 +604,25 @@
       document.getElementById('refreshPill').textContent = 'refreshing…';
       document.getElementById('refreshBtn').disabled = true;
       layerGroup.clearLayers();
+      alertsLayer.clearLayers();
+      coverageLayer.clearLayers();
 
-      const byId = await fetchWindBorne24h();
+      const [byId, alertFeatures] = await Promise.all([
+        fetchWindBorne24h(),
+        fetchExtremeEvents()
+      ]);
+      const alertShapes = prepareAlertShapes(alertFeatures, alertsLayer);
       const bounds = [];
       let totalKm = 0;
       let speeds = [];
       let aligned = 0, segs = 0;
       const meteoBudget = { remaining: WIND_MAX_PER_RENDER, skipped: false };
+      const alertCoverage = { total: alertShapes.length, balloons: 0, covered: new Set(), hits: new Map() };
+      const coverageCells = new Map();
 
-      for (const [id, pts] of byId) {
-        if (pts.length < 2) continue;
+        for (const [id, pts] of byId) {
+          const cellsTouched = new Set();
+          if (pts.length < 2) continue;
         const label = id ?? 'unknown';
         const latlngs = pts.map(p => [p.lat, p.lon]);
         latlngs.forEach(ll => bounds.push(ll));
@@ -423,11 +646,31 @@
           L.polyline([latlngs[i-1], latlngs[i]], { color: segColors[i-1], weight: 4, opacity: 0.9 }).addTo(layerGroup);
         }
 
+        for (const p of pts) {
+          const cell = coverageCellForPoint(p.lat, p.lon);
+          if (!cell) continue;
+          const key = cell.key;
+          if (!coverageCells.has(key)) coverageCells.set(key, { ...cell, count: 0, latest: 0 });
+          const node = coverageCells.get(key);
+          if (!cellsTouched.has(key)) {
+            node.count += 1;
+            cellsTouched.add(key);
+          }
+          if (p.ts > node.latest) node.latest = p.ts;
+        }
+
         const last = pts[pts.length-1];
         // Query Open‑Meteo for the last point's wind (limited & cached)
         const meteo = await fetchOpenMeteo(last.lat, last.lon, meteoBudget);
         let windStr = meteoBudget.skipped ? 'rate limited' : '—';
         let alignStr = '';
+        const alertHit = findAlertHit([last.lon, last.lat], alertShapes);
+        if (alertHit) {
+          alertCoverage.balloons++;
+          alertCoverage.covered.add(alertHit.id);
+          const prev = alertCoverage.hits.get(alertHit.id) || 0;
+          alertCoverage.hits.set(alertHit.id, prev + 1);
+        }
         if (meteo && meteo.hourly && meteo.hourly.time) {
           // Match nearest hour to last.ts
           const idx = meteo.hourly.time.findIndex(t => Math.abs(Date.parse(t+'Z') - last.ts) < 90*60*1000);
@@ -446,10 +689,13 @@
 
         const marker = L.circleMarker([last.lat, last.lon], { radius: 6, color: '#111827', weight: 2, fillColor: '#22c55e', fillOpacity: .9 })
           .bindTooltip(
-            `<strong>${label}</strong><br/>Pts: ${pts.length}<br/>Last: ${new Date(last.ts).toUTCString()}<br/>Wind (10m): ${windStr}${alignStr}`,
+            `<strong>${label}</strong><br/>Pts: ${pts.length}<br/>Last: ${new Date(last.ts).toUTCString()}<br/>Wind (10m): ${windStr}${alignStr}${alertHit ? `<br/>Alert: ${alertHit.title}` : ''}`,
             { direction: 'top', sticky: true }
           )
           .addTo(layerGroup);
+        if (alertHit) {
+          marker.setStyle({ fillColor: '#ef4444' });
+        }
       }
 
       if (bounds.length) map.fitBounds(bounds, { padding: [20,20] }); else map.setView([20,0], 2);
@@ -460,6 +706,11 @@
       document.getElementById('statKm').textContent = fmtKm(totalKm);
       document.getElementById('statSpeed').textContent = speeds.length ? fmtKmh(med(speeds)) : '–';
       document.getElementById('statAlign').textContent = segs ? `${Math.round(100*aligned/segs)}%` : '–';
+      document.getElementById('statAlerts').textContent = alertShapes.length
+        ? `${alertCoverage.covered.size}/${alertShapes.length}`
+        : '0';
+      document.getElementById('statAlertBalloons').textContent = alertCoverage.balloons;
+      updateRecommendations(coverageCells, alertShapes, alertCoverage, coverageLayer);
 
       document.getElementById('refreshPill').textContent = 'live';
       document.getElementById('refreshBtn').disabled = false;
