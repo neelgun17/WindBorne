@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WindBorne Constellation — 24h Live Map</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #app { display: grid; grid-template-columns: 320px 1fr; grid-template-rows: auto 1fr; height: 100%; }
+    header { grid-column: 1 / -1; padding: 12px 16px; border-bottom: 1px solid #e5e7eb; display:flex; gap:12px; align-items:center; }
+    header h1 { font-size: 18px; margin: 0; }
+    #sidebar { border-right: 1px solid #e5e7eb; padding: 12px; overflow: auto; }
+    #map { width: 100%; height: 100%; }
+    .stat { display: grid; grid-template-columns: 1fr auto; padding: 8px 0; border-bottom: 1px dashed #eee; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:9999px; background:#eef2ff; font-size:12px; }
+    .row { margin: 8px 0; }
+    .small { color:#6b7280; font-size:12px; }
+    .btn { background:#111827; color:white; border:0; padding:8px 10px; border-radius:10px; cursor:pointer; }
+    .btn:disabled { opacity:.5; cursor:default; }
+    .legend { position:absolute; bottom:12px; right:12px; background:white; border:1px solid #e5e7eb; border-radius:10px; padding:8px 10px; font-size:12px; box-shadow: 0 4px 12px rgba(0,0,0,.06); }
+    .bar { height:6px; background: linear-gradient(90deg, #22c55e, #eab308, #ef4444); border-radius:9999px; }
+    .footer { font-size: 12px; color:#6b7280; margin-top: 8px; }
+    a { color:#2563eb; text-decoration:none; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>WindBorne Constellation — last 24h</h1>
+      <span class="pill" id="refreshPill">refreshing…</span>
+      <button class="btn" id="refreshBtn" title="Force refresh">Refresh</button>
+    </header>
+
+    <aside id="sidebar">
+      <div class="row"><strong>Summary (rolling 24h)</strong></div>
+      <div class="stat"><span>Balloons tracked</span><strong id="statBalloons">–</strong></div>
+      <div class="stat"><span>Total path length</span><strong id="statKm">–</strong></div>
+      <div class="stat"><span>Median ground speed</span><strong id="statSpeed">–</strong></div>
+      <div class="stat"><span>Wind alignment &lt; 45°</span><strong id="statAlign">–</strong></div>
+      <div class="row">
+        <div class="small">Tracks are colored by per‑segment ground speed (green → fast, red → slow). Hover markers for details. Updates every 5 minutes.</div>
+      </div>
+
+      <div class="row"><strong>Data Sources</strong>
+        <div class="small">
+          • WindBorne live snapshots: <code>a.windbornesystems.com/treasure/00..23.json</code><br/>
+          • External: <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open‑Meteo</a> hourly wind at 10m (no key)
+        </div>
+        <div class="small" id="log" style="margin-top:6px; padding:6px; border:1px dashed #e5e7eb; border-radius:8px; background:#fafafa; max-height:120px; overflow:auto;">
+          status: initializing…
+        </div>
+      </div>
+
+      <div class="row"><strong>Export</strong>
+        <div class="small"><button class="btn" id="exportBtn">Download GeoJSON</button></div>
+      </div>
+
+      <div class="footer">Map © <a href="https://www.openstreetmap.org/" target="_blank" rel="noreferrer">OSM</a> contributors • Tiles © OSM | Built for WindBorne challenge</div>
+    </aside>
+
+    <main id="map"></main>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script>
+    // --- Utilities ---
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const toRad = (d) => d * Math.PI / 180;
+    const haversineKm = (a, b) => {
+      const R = 6371; // km
+      const dLat = toRad(b.lat - a.lat);
+      const dLon = toRad(b.lon - a.lon);
+      const lat1 = toRad(a.lat);
+      const lat2 = toRad(b.lat);
+      const h = Math.sin(dLat/2)**2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon/2)**2;
+      return 2 * R * Math.asin(Math.sqrt(h));
+    };
+    const bearingDeg = (a, b) => {
+      const y = Math.sin(toRad(b.lon - a.lon)) * Math.cos(toRad(b.lat));
+      const x = Math.cos(toRad(a.lat))*Math.sin(toRad(b.lat)) - Math.sin(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.cos(toRad(b.lon - a.lon));
+      const brng = Math.atan2(y, x) * 180/Math.PI;
+      return (brng + 360) % 360;
+    };
+
+    const LOCAL_PROXY = 'http://127.0.0.1:8787';
+    const WIND_TILE_SIZE_DEG = 0.5; // quantize coordinates to reuse Open-Meteo responses
+    const WIND_CACHE_TTL_MS = 30 * 60 * 1000;
+    const WIND_MAX_PER_RENDER = 120;
+    const meteoCache = new Map();
+
+    // Try to coerce a WindBorne record into {id, lat, lon, ts}
+    function normalizeRecord(rec) {
+      if (!rec || typeof rec !== 'object') return null;
+      const id = rec.id || rec.name || rec.unit_id || rec.serial || rec.balloon_id || null;
+      const lat = rec.lat ?? rec.latitude ?? rec.Latitude ?? null;
+      const lon = rec.lon ?? rec.longitude ?? rec.Longitude ?? null;
+      let ts = rec.ts || rec.timestamp || rec.time || rec.updated_at || null;
+      const alt = rec.alt ?? rec.altitude ?? rec.Altitude ?? null;
+      if (typeof ts === 'string') {
+        const t = Date.parse(ts);
+        if (!Number.isNaN(t)) ts = t; else ts = null;
+      }
+      if (typeof ts === 'number' && ts < 2e12) { ts = ts * 1000; } // seconds → ms
+      if (lat == null || lon == null) return null;
+      return { id, lat: +lat, lon: +lon, ts: ts ?? Date.now(), syntheticId: !id, alt: alt != null ? +alt : null };
+    }
+
+    // Attempt to interpret any snapshot shape into normalized points
+    function coercePointsFromAny(blob, hourAge) {
+      const out = [];
+      const ts = Date.now() - hourAge * 3600 * 1000;
+      const pushPt = (lat, lon, opts = {}) => {
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        const { id = null, synthetic = false, alt = null } = opts;
+        out.push({ id, lat: +lat, lon: +lon, ts, syntheticId: synthetic || !id, alt: alt != null ? +alt : null });
+      };
+      const isLat = (x) => typeof x === 'number' && Math.abs(x) <= 90;
+      const isLon = (x) => typeof x === 'number' && Math.abs(x) <= 180;
+
+      if (Array.isArray(blob)) {
+        if (blob.length && typeof blob[0] === 'number') {
+          for (let i = 0; i + 1 < blob.length; i += 2) {
+            const a = +blob[i], b = +blob[i+1];
+            if (isLat(a) && isLon(b)) pushPt(a, b, { synthetic: true });
+            else if (isLat(b) && isLon(a)) pushPt(b, a, { synthetic: true });
+          }
+          return out;
+        }
+        if (blob.length && Array.isArray(blob[0])) {
+          for (const tuple of blob) {
+            if (!Array.isArray(tuple) || tuple.length < 2) continue;
+            const a = +tuple[0], b = +tuple[1];
+            const alt = tuple.length >= 3 ? +tuple[2] : null;
+            if (isLat(a) && isLon(b)) pushPt(a, b, { synthetic: true, alt });
+            else if (isLat(b) && isLon(a)) pushPt(b, a, { synthetic: true, alt });
+          }
+          return out;
+        }
+        for (const rec of blob) {
+          const norm = normalizeRecord(rec);
+          if (norm) out.push({ ...norm, ts: norm.ts ?? ts });
+        }
+        return out;
+      }
+
+      if (blob && typeof blob === 'object') {
+        const entries = Object.entries(blob);
+        if (entries.length && Array.isArray(entries[0][1])) {
+          for (const [key, arr] of entries) {
+            if (!Array.isArray(arr)) continue;
+            let idx = 0;
+            for (const val of arr) {
+              if (Array.isArray(val) && val.length >= 2) {
+                const a = +val[0], b = +val[1];
+                const id = key && typeof key === 'string' ? key : null;
+                const alt = val.length >= 3 ? +val[2] : null;
+                if (isLat(a) && isLon(b)) pushPt(a, b, { id, synthetic: !id, alt });
+                else if (isLat(b) && isLon(a)) pushPt(b, a, { id, synthetic: !id, alt });
+              } else if (val && typeof val === 'object') {
+                const norm = normalizeRecord(val);
+                if (norm) {
+                  const finalId = norm.id || key || null;
+                  out.push({ ...norm, id: finalId, syntheticId: !finalId, ts: norm.ts ?? ts });
+                }
+              }
+              idx++;
+            }
+          }
+          return out;
+        }
+        if (Array.isArray(blob.lats) && Array.isArray(blob.lons)) {
+          const n = Math.min(blob.lats.length, blob.lons.length);
+          for (let i = 0; i < n; i++) pushPt(blob.lats[i], blob.lons[i], { synthetic: true });
+          return out;
+        }
+        const norm = normalizeRecord(blob);
+        if (norm) out.push({ ...norm, ts: norm.ts ?? ts });
+      }
+      return out;
+    }
+
+    async function fetchJsonRobust(url) {
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        const text = await res.text();
+        try {
+          return JSON.parse(text);
+        } catch (e) {
+          const safe = text
+            .replace(/,\s*]/g, "]")
+            .replace(/,\s*}/g, "}")
+            .replace(/[^\{\}\[\]\:,"0-9\-\+\.a-zA-Z_\s]/g, '');
+          try { return JSON.parse(safe); } catch { return null; }
+        }
+      } catch (e) { return null; }
+    }
+
+    async function fetchWithFallback(urls) {
+      for (const u of urls) {
+        const j = await fetchJsonRobust(u);
+        if (j) return j;
+      }
+      return null;
+    }
+
+    async function fetchWindBorne24h() {
+      const perHour = [];
+      const failures = [];
+      for (let h = 0; h <= 23; h++) {
+        const hh = h.toString().padStart(2, '0');
+        const direct = `https://a.windbornesystems.com/treasure/${hh}.json`;
+        const proxy1 = `https://r.jina.ai/http://a.windbornesystems.com/treasure/${hh}.json`;
+        const proxy2 = `https://r.jina.ai/https://a.windbornesystems.com/treasure/${hh}.json`;
+        const blob = await fetchWithFallback([
+          `${LOCAL_PROXY}/treasure/${hh}.json`,
+          proxy1,
+          proxy2,
+          direct
+        ]);
+        // Be polite to proxies to avoid 429; bump to ~0.5s between requests
+        await sleep(500);
+        if (!blob) { failures.push(hh); continue; }
+        const pts = coercePointsFromAny(blob.data || blob.items || blob, h).map(p => ({ ...p, ageH: h }));
+        perHour[h] = pts;
+      }
+      const byId = stitchTracks(perHour);
+      const log = document.getElementById('log');
+      if (log) {
+        if (failures.length) log.textContent = `loaded with fallbacks; missing hours: ${failures.join(', ')}`;
+        else log.textContent = 'loaded ok';
+      }
+      return byId;
+    }
+
+    function stitchTracks(hours) {
+      const MAX_GAP_MS = 1 * 3600 * 1000;
+      const MAX_DIST_KM = 150;
+      const MAX_SPEED_KMH = 50;
+      const MAX_ALT_DIFF = 10; // meters? unspecified; treat as heuristic
+      const BUCKET_DEG = 3;
+      const tracks = new Map();
+      let syntheticCounter = 0;
+      let lastHourBuckets = new Map();
+
+      const attach = (trackId, pt) => {
+        if (!tracks.has(trackId)) tracks.set(trackId, []);
+        tracks.get(trackId).push({ ...pt, id: trackId, syntheticId: false });
+      };
+
+      const baseBucket = (lat, lon) => {
+        const bLat = Math.floor(lat / BUCKET_DEG);
+        const bLon = Math.floor(lon / BUCKET_DEG);
+        return { bLat, bLon };
+      };
+
+      const neighborBuckets = (lat, lon) => {
+        const { bLat, bLon } = baseBucket(lat, lon);
+        const keys = [];
+        for (let dLat = -1; dLat <= 1; dLat++) {
+          for (let dLon = -1; dLon <= 1; dLon++) {
+            keys.push(`${bLat + dLat}:${bLon + dLon}`);
+          }
+        }
+        return keys;
+      };
+
+      for (let h = 0; h < hours.length; h++) {
+        const pts = hours[h] || [];
+        const currentBuckets = new Map();
+        for (const raw of pts) {
+          if (!raw || !Number.isFinite(raw.lat) || !Number.isFinite(raw.lon) || !Number.isFinite(raw.ts)) continue;
+          const pt = { ...raw };
+          const nativeId = pt.id && !pt.syntheticId ? pt.id : null;
+          let trackId = nativeId;
+
+          if (!trackId && lastHourBuckets.size) {
+            let best = null;
+            const targetBuckets = neighborBuckets(pt.lat, pt.lon);
+            for (const key of targetBuckets) {
+              const bucket = lastHourBuckets.get(key);
+              if (!bucket) continue;
+              for (const candidate of bucket) {
+                const dt = candidate.point.ts - pt.ts;
+                if (dt <= 0 || dt > MAX_GAP_MS) continue;
+                if (pt.alt != null && candidate.point.alt != null) {
+                  const altDiff = Math.abs(pt.alt - candidate.point.alt);
+                  if (altDiff > MAX_ALT_DIFF) continue;
+                }
+                const dist = haversineKm(candidate.point, pt);
+                if (!Number.isFinite(dist) || dist > MAX_DIST_KM) continue;
+                const hoursDiff = Math.max(dt / 3600000, 1/60);
+                const speed = dist / hoursDiff;
+                if (!Number.isFinite(speed) || speed > MAX_SPEED_KMH) continue;
+                if (!best || dist < best.dist) best = { dist, trackId: candidate.trackId };
+              }
+            }
+            if (best) trackId = best.trackId;
+          }
+
+          if (!trackId) {
+            trackId = `track-${syntheticCounter++}`;
+          }
+          attach(trackId, pt);
+          const { bLat, bLon } = baseBucket(pt.lat, pt.lon);
+          const bucketKey = `${bLat}:${bLon}`;
+          if (!currentBuckets.has(bucketKey)) currentBuckets.set(bucketKey, []);
+          currentBuckets.get(bucketKey).push({ trackId, point: { ...pt, id: trackId } });
+        }
+        lastHourBuckets = currentBuckets;
+      }
+
+      for (const [id, arr] of tracks) {
+        arr.sort((a,b) => a.ts - b.ts);
+        const dedup = [];
+        for (const p of arr) {
+          const last = dedup[dedup.length - 1];
+          if (!last || last.lat !== p.lat || last.lon !== p.lon || last.ts !== p.ts) dedup.push(p);
+        }
+        tracks.set(id, dedup);
+      }
+      return tracks;
+    }
+
+    async function fetchOpenMeteo(lat, lon, budget) {
+      const quantizedLat = Math.round(lat / WIND_TILE_SIZE_DEG) * WIND_TILE_SIZE_DEG;
+      const quantizedLon = Math.round(lon / WIND_TILE_SIZE_DEG) * WIND_TILE_SIZE_DEG;
+      const cacheKey = `${quantizedLat.toFixed(2)},${quantizedLon.toFixed(2)}`;
+      const cached = meteoCache.get(cacheKey);
+      if (cached && (Date.now() - cached.at) < WIND_CACHE_TTL_MS) {
+        return cached.data;
+      }
+      if (budget) {
+        if (budget.remaining <= 0) {
+          budget.skipped = true;
+          return null;
+        }
+        budget.remaining -= 1;
+      }
+      // Hourly 10m wind; Open‑Meteo does not require an API key
+      const url = new URL('https://api.open-meteo.com/v1/forecast');
+      url.searchParams.set('latitude', quantizedLat.toFixed(4));
+      url.searchParams.set('longitude', quantizedLon.toFixed(4));
+      url.searchParams.set('hourly', 'wind_speed_10m,wind_direction_10m');
+      url.searchParams.set('past_days', '1');
+      url.searchParams.set('forecast_days', '1');
+      url.searchParams.set('timezone', 'UTC');
+      // The API returns arrays aligned to hourly timestamps in UTC
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) return null;
+        const j = await res.json();
+        meteoCache.set(cacheKey, { at: Date.now(), data: j });
+        return j;
+      } catch { return null; }
+    }
+
+    function colorForSpeed(kmh) {
+      // Map 0..120 km/h to green → yellow → red
+      const clamped = Math.max(0, Math.min(120, kmh));
+      const t = clamped / 120; // 0..1
+      const r = Math.round(255 * (t < 0.5 ? t*2 : 1));
+      const g = Math.round(255 * (t < 0.5 ? 1 : (1-(t-0.5)*2)));
+      return `rgb(${r},${g},80)`;
+    }
+
+    // --- Map setup ---
+    const map = L.map('map');
+    const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    const layerGroup = L.layerGroup().addTo(map);
+    const legend = L.control({ position: 'bottomright' });
+    legend.onAdd = function() {
+      const div = L.DomUtil.create('div', 'legend');
+      div.innerHTML = '<div><strong>Ground speed</strong></div><div class="bar"></div><div class="small">0 → 120+ km/h</div>';
+      return div;
+    };
+    legend.addTo(map);
+
+    function fmtKm(n){ return `${n.toFixed(1)} km`; }
+    function fmtKmh(n){ return `${n.toFixed(0)} km/h`; }
+
+    async function render() {
+      document.getElementById('refreshPill').textContent = 'refreshing…';
+      document.getElementById('refreshBtn').disabled = true;
+      layerGroup.clearLayers();
+
+      const byId = await fetchWindBorne24h();
+      const bounds = [];
+      let totalKm = 0;
+      let speeds = [];
+      let aligned = 0, segs = 0;
+      const meteoBudget = { remaining: WIND_MAX_PER_RENDER, skipped: false };
+
+      for (const [id, pts] of byId) {
+        if (pts.length < 2) continue;
+        const label = id ?? 'unknown';
+        const latlngs = pts.map(p => [p.lat, p.lon]);
+        latlngs.forEach(ll => bounds.push(ll));
+
+        // Segment speeds and colors
+        const segColors = [];
+        const speedsKmh = [];
+        for (let i=1; i<pts.length; i++) {
+          const a = pts[i-1], b = pts[i];
+          const dtH = Math.max( (b.ts - a.ts) / 3600000, 1/60 );
+          const dKm = haversineKm(a, b);
+          const v = dKm / dtH;
+          totalKm += dKm;
+          speeds.push(v);
+          speedsKmh.push(v);
+          segColors.push(colorForSpeed(v));
+        }
+
+        // Draw polyline with gradient-ish segments
+        for (let i=1; i<latlngs.length; i++) {
+          L.polyline([latlngs[i-1], latlngs[i]], { color: segColors[i-1], weight: 4, opacity: 0.9 }).addTo(layerGroup);
+        }
+
+        const last = pts[pts.length-1];
+        // Query Open‑Meteo for the last point's wind (limited & cached)
+        const meteo = await fetchOpenMeteo(last.lat, last.lon, meteoBudget);
+        let windStr = meteoBudget.skipped ? 'rate limited' : '—';
+        let alignStr = '';
+        if (meteo && meteo.hourly && meteo.hourly.time) {
+          // Match nearest hour to last.ts
+          const idx = meteo.hourly.time.findIndex(t => Math.abs(Date.parse(t+'Z') - last.ts) < 90*60*1000);
+          const wspd = idx>=0 ? meteo.hourly.wind_speed_10m[idx] : null;
+          const wdir = idx>=0 ? meteo.hourly.wind_direction_10m[idx] : null;
+          if (wspd != null && wdir != null && pts.length >= 2) {
+            windStr = `${wspd.toFixed(0)} km/h @ ${wdir.toFixed(0)}°`;
+            const brg = bearingDeg(pts[pts.length-2], last);
+            const delta = Math.min(Math.abs(brg - wdir), 360 - Math.abs(brg - wdir));
+            if (!Number.isNaN(delta)) {
+              segs++; if (delta < 45) aligned++;
+              alignStr = `\nAlignment Δ: ${delta.toFixed(0)}°`;
+            }
+          }
+        }
+
+        const marker = L.circleMarker([last.lat, last.lon], { radius: 6, color: '#111827', weight: 2, fillColor: '#22c55e', fillOpacity: .9 })
+          .bindTooltip(
+            `<strong>${label}</strong><br/>Pts: ${pts.length}<br/>Last: ${new Date(last.ts).toUTCString()}<br/>Wind (10m): ${windStr}${alignStr}`,
+            { direction: 'top', sticky: true }
+          )
+          .addTo(layerGroup);
+      }
+
+      if (bounds.length) map.fitBounds(bounds, { padding: [20,20] }); else map.setView([20,0], 2);
+
+      // Stats
+      const med = (arr) => arr.sort((a,b)=>a-b)[Math.floor(arr.length/2)] ?? 0;
+      document.getElementById('statBalloons').textContent = Array.from(byId.keys()).length;
+      document.getElementById('statKm').textContent = fmtKm(totalKm);
+      document.getElementById('statSpeed').textContent = speeds.length ? fmtKmh(med(speeds)) : '–';
+      document.getElementById('statAlign').textContent = segs ? `${Math.round(100*aligned/segs)}%` : '–';
+
+      document.getElementById('refreshPill').textContent = 'live';
+      document.getElementById('refreshBtn').disabled = false;
+      return byId;
+    }
+
+    async function exportGeoJSON(byId) {
+      const features = [];
+      for (const [id, pts] of byId) {
+        const label = id ?? 'unknown';
+        features.push({
+          type: 'Feature',
+          properties: { id: label, points: pts.length },
+          geometry: { type: 'LineString', coordinates: pts.map(p => [p.lon, p.lat]) }
+        });
+        const last = pts[pts.length-1];
+        features.push({
+          type: 'Feature',
+          properties: { id: label, kind: 'last' },
+          geometry: { type: 'Point', coordinates: [last.lon, last.lat] }
+        });
+      }
+      const blob = new Blob([JSON.stringify({ type:'FeatureCollection', features }, null, 2)], { type: 'application/geo+json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'windborne_24h.geojson'; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    let lastData = null;
+    document.getElementById('refreshBtn').addEventListener('click', async () => { lastData = await render(); });
+    document.getElementById('exportBtn').addEventListener('click', () => { if (lastData) exportGeoJSON(lastData); });
+
+    // Auto refresh every 5 minutes
+    (async function loop(){ lastData = await render(); setInterval(render, 5*60*1000); })();
+  </script>
+</body>
+</html>
