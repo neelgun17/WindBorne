@@ -51,6 +51,10 @@
       <div class="row"><strong>Coverage priorities</strong>
         <div class="small" id="recoList">Computing…</div>
       </div>
+      <div class="row"><strong>Launch targeting</strong>
+        <div class="small" id="launchList">Modeling launch opportunities…</div>
+        <div class="small"><button class="btn" id="launchExportBtn">Download launch plan</button></div>
+      </div>
 
       <div class="row"><strong>Data Sources</strong>
         <div class="small">
@@ -96,6 +100,7 @@
 
     const LOCAL_PROXY = 'http://127.0.0.1:8787';
     const ALERTS_API = 'https://api.weather.gov/alerts/active?status=actual&message_type=alert&severity=Severe,Extreme&certainty=Observed,Likely&limit=200';
+    const GLOBAL_EVENTS_API = 'https://eonet.gsfc.nasa.gov/api/v3/events?status=open';
     const WIND_TILE_SIZE_DEG = 0.5; // quantize coordinates to reuse Open-Meteo responses
     const WIND_CACHE_TTL_MS = 30 * 60 * 1000;
     const WIND_MAX_PER_RENDER = 120;
@@ -425,6 +430,18 @@
       return null;
     }
 
+    async function fetchGlobalEvents() {
+      try {
+        const res = await fetch(GLOBAL_EVENTS_API, { cache: 'no-store' });
+        if (!res.ok) return [];
+        const data = await res.json();
+        return Array.isArray(data.events) ? data.events : [];
+      } catch (e) {
+        console.warn('global events fetch failed', e);
+        return [];
+      }
+    }
+
     function coverageCellForPoint(lat, lon) {
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
       const latIdx = Math.floor((lat + 90) / COVERAGE_TILE_DEG);
@@ -457,6 +474,146 @@
       return { lon: cx, lat: cy };
     }
 
+    function computeLaunchPlan(coverageCells, alertShapes, alertCoverage, launchLayer, globalEvents, ignoreCoverageKeys = new Set()) {
+      const suggestions = [];
+      const now = Date.now();
+      const tileSize = COVERAGE_TILE_DEG;
+      const addSuggestion = (s) => suggestions.push(s);
+      for (const alert of alertShapes) {
+        if (alertCoverage.covered.has(alert.id)) continue;
+        const centroid = centroidOfRing(alert.outer);
+        if (!centroid) continue;
+        addSuggestion({
+          type: 'alert',
+          priority: 100,
+          lat: centroid.lat,
+          lon: centroid.lon,
+          reason: `Severe alert (${alert.severity}) lacks balloon coverage`,
+          alertTitle: alert.title
+        });
+      }
+      for (const cell of coverageCells.values()) {
+        const latMin = -90 + cell.latIdx * tileSize;
+        const lonMin = -180 + cell.lonIdx * tileSize;
+        const centerLat = latMin + tileSize / 2;
+        const centerLon = lonMin + tileSize / 2;
+        const gapH = cell.latest ? (now - cell.latest) / 3600000 : Infinity;
+        if ((gapH > COVERAGE_MAX_GAP_H || cell.count < COVERAGE_MIN_BALLOONS) && !ignoreCoverageKeys.has(cell.key)) {
+          addSuggestion({
+            type: 'coverage',
+            key: cell.key,
+            priority: gapH + (COVERAGE_MIN_BALLOONS - Math.min(cell.count, COVERAGE_MIN_BALLOONS)),
+            lat: centerLat,
+            lon: centerLon,
+            latMin,
+            lonMin,
+            gapH,
+            count: cell.count,
+            reason: `Last sampled ${gapH === Infinity ? 'never' : `${gapH.toFixed(1)}h`} ago`
+          });
+        }
+      }
+
+      if (Array.isArray(globalEvents)) {
+        for (const event of globalEvents) {
+          const categories = (event.categories || []).map(c => c.title);
+          if (!categories.some(c => /storm|fire|cyclone|flood|volcano/i.test(c))) continue;
+          const latestGeo = (event.geometry || []).slice(-1)[0];
+          if (!latestGeo || !Array.isArray(latestGeo.coordinates)) continue;
+          const [lon, lat] = latestGeo.coordinates;
+          const cell = coverageCellForPoint(lat, lon);
+          let coverage = { count: 0, gapH: Infinity };
+          if (cell) {
+            const key = cell.key;
+            if (coverageCells.has(key)) {
+              const info = coverageCells.get(key);
+              coverage = {
+                count: info.count,
+                gapH: info.latest ? (now - info.latest) / 3600000 : Infinity
+              };
+            }
+          }
+          if (coverage.count >= COVERAGE_MIN_BALLOONS && coverage.gapH < COVERAGE_MAX_GAP_H) continue;
+          addSuggestion({
+            type: 'globalEvent',
+            priority: 80,
+            lat,
+            lon,
+            reason: `${event.title} (${categories.join(', ')}) lacks fresh samples`,
+            eventTitle: event.title,
+            gapH: coverage.gapH
+          });
+        }
+      }
+
+      suggestions.sort((a, b) => b.priority - a.priority);
+      const plan = suggestions.slice(0, 5);
+
+      if (!plan.length) {
+        document.getElementById('launchList').textContent = 'Live constellation already covers all monitored hazards.';
+      } else {
+        document.getElementById('launchList').innerHTML = plan.map(s => {
+          if (s.type === 'alert') {
+            return `<div>🚀 ${s.alertTitle || 'Severe alert'}<br/><span class="small">${s.reason}</span></div>`;
+          }
+          if (s.type === 'globalEvent') {
+            return `<div>🌐 ${s.eventTitle}<br/><span class="small">${s.reason}</span></div>`;
+          }
+          return `<div>🚀 ${s.lat.toFixed(1)}°, ${s.lon.toFixed(1)}°<br/><span class="small">${s.reason} • ${s.count} balloon(s) seen.</span></div>`;
+        }).join('');
+      }
+
+      launchLayer.clearLayers();
+      for (const s of plan) {
+        if (s.type === 'alert') {
+          L.circleMarker([s.lat, s.lon], {
+            radius: 7,
+            color: '#f97316',
+            fillColor: '#f97316',
+            fillOpacity: 0.9
+          }).bindTooltip(
+            `${s.alertTitle || 'Severe alert'}<br/>${s.reason}`,
+            { sticky: true }
+          ).addTo(launchLayer);
+        } else if (s.type === 'globalEvent') {
+          L.circleMarker([s.lat, s.lon], {
+            radius: 6,
+            color: '#2563eb',
+            fillColor: '#2563eb',
+            fillOpacity: 0.9
+          }).bindTooltip(
+            `${s.eventTitle}<br/>${s.reason}`,
+            { sticky: true }
+          ).addTo(launchLayer);
+        } else {
+          const bounds = [
+            [s.latMin, s.lonMin],
+            [s.latMin + tileSize, s.lonMin + tileSize]
+          ];
+          L.rectangle(bounds, {
+            color: '#22c55e',
+            weight: 1.5,
+            dashArray: '4 4',
+            fillOpacity: 0
+          }).bindTooltip(
+            `Coverage gap<br/>${s.reason}<br/>Balloons seen: ${s.count}`,
+            { sticky: true }
+          ).addTo(launchLayer);
+        }
+      }
+      lastLaunchPlan = plan.map(s => ({
+        type: s.type,
+        lat: s.lat,
+        lon: s.lon,
+        reason: s.reason,
+        alert: s.alertTitle || null,
+        event: s.eventTitle || null,
+        count: s.count ?? null,
+        gap_hours: s.gapH ?? null
+      }));
+      return lastLaunchPlan;
+    }
+
     function updateRecommendations(coverageCells, alertShapes, alertCoverage, coverageLayer) {
       const suggestions = [];
       const now = Date.now();
@@ -470,6 +627,7 @@
         if (gapH > COVERAGE_MAX_GAP_H || cell.count < COVERAGE_MIN_BALLOONS) {
           suggestions.push({
             type: 'coverage',
+            key: cell.key,
             priority: gapH + (COVERAGE_MIN_BALLOONS - Math.min(cell.count, COVERAGE_MIN_BALLOONS)),
             lat: centerLat,
             lon: centerLon,
@@ -537,6 +695,9 @@
           ).addTo(coverageLayer);
         }
       }
+      return {
+        coverageKeys: new Set(top.filter(s => s.type === 'coverage').map(s => s.key || `${s.lat.toFixed(1)}:${s.lon.toFixed(1)}`))
+      };
     }
 
     async function fetchOpenMeteo(lat, lon, budget) {
@@ -589,6 +750,7 @@
     const layerGroup = L.layerGroup().addTo(map);
     const alertsLayer = L.layerGroup().addTo(map);
     const coverageLayer = L.layerGroup().addTo(map);
+    const launchLayer = L.layerGroup().addTo(map);
     const legend = L.control({ position: 'bottomright' });
     legend.onAdd = function() {
       const div = L.DomUtil.create('div', 'legend');
@@ -606,10 +768,12 @@
       layerGroup.clearLayers();
       alertsLayer.clearLayers();
       coverageLayer.clearLayers();
+      launchLayer.clearLayers();
 
-      const [byId, alertFeatures] = await Promise.all([
+      const [byId, alertFeatures, globalEvents] = await Promise.all([
         fetchWindBorne24h(),
-        fetchExtremeEvents()
+        fetchExtremeEvents(),
+        fetchGlobalEvents()
       ]);
       const alertShapes = prepareAlertShapes(alertFeatures, alertsLayer);
       const bounds = [];
@@ -710,7 +874,8 @@
         ? `${alertCoverage.covered.size}/${alertShapes.length}`
         : '0';
       document.getElementById('statAlertBalloons').textContent = alertCoverage.balloons;
-      updateRecommendations(coverageCells, alertShapes, alertCoverage, coverageLayer);
+      const coverageSummary = updateRecommendations(coverageCells, alertShapes, alertCoverage, coverageLayer);
+      const launchPlan = computeLaunchPlan(coverageCells, alertShapes, alertCoverage, launchLayer, globalEvents, coverageSummary.coverageKeys);
 
       document.getElementById('refreshPill').textContent = 'live';
       document.getElementById('refreshBtn').disabled = false;
@@ -741,11 +906,23 @@
     }
 
     let lastData = null;
+    let lastLaunchPlan = [];
     document.getElementById('refreshBtn').addEventListener('click', async () => { lastData = await render(); });
     document.getElementById('exportBtn').addEventListener('click', () => { if (lastData) exportGeoJSON(lastData); });
+    document.getElementById('launchExportBtn').addEventListener('click', () => {
+      if (!lastLaunchPlan.length) return;
+      const blob = new Blob([JSON.stringify({ generated_at: new Date().toISOString(), recommendations: lastLaunchPlan }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'windborne_launch_plan.json'; a.click();
+      URL.revokeObjectURL(url);
+    });
 
     // Auto refresh every 5 minutes
-    (async function loop(){ lastData = await render(); setInterval(render, 5*60*1000); })();
+    (async function loop(){
+      lastData = await render();
+      setInterval(async () => { lastData = await render(); }, 5*60*1000);
+    })();
   </script>
 </body>
 </html>
